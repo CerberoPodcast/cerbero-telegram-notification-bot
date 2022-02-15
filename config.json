@@ -1,0 +1,11 @@
+{
+  "twitchClientId": "okrk7mgiy5wz86br7x4r4ihi4ptla9",
+  "twitchClientToken": "cqjmwlj6ph9set8bbv8j61bzxkzwh6",
+  "telegramBotToken": "786197398:AAG2O4zgsycmI2i9-4JcPDjal2eo0h9YGec",
+  "channels": {
+    "cerbero_podcast": {
+      "groupId": -1001263423702,
+      "channelId": -1001349186819
+    }
+  }
+}
