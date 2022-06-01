@@ -1,4 +1,8 @@
 build
+twitch.tokens.json
+state.json
+config.json
+deploy.sh
 
 # Created by https://www.toptal.com/developers/gitignore/api/node,linux,macos,windows,webstorm+all
 # Edit at https://www.toptal.com/developers/gitignore?templates=node,linux,macos,windows,webstorm+all

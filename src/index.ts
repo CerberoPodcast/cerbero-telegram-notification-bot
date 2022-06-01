@@ -13,12 +13,13 @@ class LowWithLodash<T> extends Low<T> {
 type ConfigChannelEntry = {
   groupId: number,
   channelId: number,
+  bot: string,
 };
 type Config = {
   twitchClientId: string,
   twitchClientToken: string,
-  telegramBotToken: string,
   channels: Record<string, ConfigChannelEntry>,
+  bots: Record<string, string>,
 };
 
 type ChannelState = {
@@ -31,16 +32,24 @@ type StatusDb = Record<string, ChannelState>;
 
 const config = JSON.parse(fs.readFileSync('./config.json').toString('utf-8')) as Config;
 
-const botTokens = JSON.parse(fs.readFileSync('./twitch.tokens.json', 'utf-8').toString());
+const twitchBotTokens = JSON.parse(fs.readFileSync('./twitch.tokens.json', 'utf-8').toString());
 const authProvider = new RefreshingAuthProvider({
   clientId: config.twitchClientId,
   clientSecret: config.twitchClientToken,
   onRefresh: async newTokenData => {
     return fs.promises.writeFile('./twitch.tokens.json', JSON.stringify(newTokenData, null, 2), 'utf-8');
   }
-}, botTokens);
+}, twitchBotTokens);
 
-const bot = new Telegraf(config.telegramBotToken);
+const bots = Object.fromEntries(Object.entries(config.bots).map(([key, token]) => [key, new Telegraf(token)]));
+function getBot(name: string) {
+  const bot = bots[name];
+  if (!bot) {
+    throw new Error(`Unknown bot ${name}`);
+  }
+  return bot;
+}
+
 const apiClient = new ApiClient({authProvider});
 
 const statusDb = new LowWithLodash(new JSONFile<StatusDb>('./state.json'));
@@ -59,6 +68,8 @@ for (const channel of Object.keys(config.channels)) {
 await statusDb.write();
 
 async function update(channelName: string, channelConfig: ConfigChannelEntry) {
+  const bot = getBot(channelConfig.bot);
+
   console.log('Checking user ' + channelName + '!');
   const state = statusDb.chain.get(channelName).value();
 
@@ -110,7 +121,7 @@ async function update(channelName: string, channelConfig: ConfigChannelEntry) {
   }
   state.lastStreamTitle = title;
 
-  const streamLinkHtml = `<a href='https://twitch.tv/${stream.userName}?rid=${crypto.randomBytes(5).toString('hex')}'>twitch.tv/cerbero_podcast</a>`;
+  const streamLinkHtml = `<a href='https://twitch.tv/${stream.userName}?rid=${crypto.randomBytes(5).toString('hex')}'>twitch.tv/${stream.userName}</a>`;
   const message = `${title} | IN ONDA | ${streamLinkHtml}`;
 
   if (state.lastStreamId === stream.id) {
@@ -120,7 +131,7 @@ async function update(channelName: string, channelConfig: ConfigChannelEntry) {
       return;
     }
     // Title changed! Edit message!
-    await bot.telegram.editMessageText(channelConfig.channelId, state.lastMessageId, undefined, message, {
+    await bot.telegram.editMessageText(channelConfig.channelId || channelConfig.groupId, state.lastMessageId, undefined, message, {
       parse_mode: 'HTML'
     });
     await statusDb.write();
@@ -131,61 +142,37 @@ async function update(channelName: string, channelConfig: ConfigChannelEntry) {
   // New stream!
   console.log('New stream detected! Notify!');
   // Send notification and pin message
-  const result = await bot.telegram.sendMessage(channelConfig.channelId, message, {
+  const sendResult = await bot.telegram.sendMessage(channelConfig.channelId || channelConfig.groupId, message, {
     parse_mode: 'HTML'
   });
-  state.lastMessageId = result.message_id;
-  /*
-  if(pinNotification) {
-      bot.telegram.pinChatMessage(telegramGroupId, messageId);
-      lastGroupMessageId = messageId;
+  state.lastMessageId = sendResult.message_id;
+
+  if (channelConfig.channelId) {
+    const forwardResult = await bot.telegram.forwardMessage(channelConfig.groupId, channelConfig.channelId, state.lastMessageId);
+    state.lastGroupMessageId = forwardResult.message_id;
+  } else {
+    state.lastGroupMessageId = state.lastMessageId;
   }
-  */
+
+  await bot.telegram.pinChatMessage(channelConfig.groupId, state.lastGroupMessageId);
+
   await statusDb.write();
 }
 
-/*
-bot.on('message', (ctx) => {
-	for (const channel of config.channels) {
-		for (const target of targets) {
-			if (target.mode !== 'channel' || !target.linkedGroup) {
-				continue;
-			}
-			if (ctx.chat.id !== target.linkedGroup) {
-				continue;
-			}
-			if (ctx.message.forward_from_chat?.id !== target.id) {
-				continue;
-			}
-			console.log(`Detected a message from a target channel inside the linked group! (Twitch: '${channel.name}', Channel: '${target.id}', Group: '${target.linkedGroup}')`);
-			target.lastGroupMessageId = ctx.message.message_id;
-		}
-		return;
-	}
+process.once('SIGINT', () => {
+  for (const bot of Object.values(bots)) {
+    bot.stop('SIGINT');
+  }
 });
-*/
-
-bot.on('message', (ctx) => {
-  for (const [channel, channelConfig] of Object.entries(config.channels)) {
-    if (ctx.chat.id !== channelConfig.groupId) {
-      return;
-    }
-    // @ts-ignore Undocumented field
-    const forwardedFrom = ctx.message.forward_from_chat?.id;
-    if (forwardedFrom !== channelConfig.channelId) {
-      return;
-    }
-    console.log(`Detected message in group for channel ${channel}!`);
-    const state = statusDb.chain.get(channel).value();
-    state.lastGroupMessageId = ctx.message.message_id;
-
+process.once('SIGTERM', () => {
+  for (const bot of Object.values(bots)) {
+    bot.stop('SIGTERM');
   }
 });
 
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
-
-await bot.launch();
+for (const bot of Object.values(bots)) {
+  await bot.launch();
+}
 
 async function updateAll() {
   for (const [channel, channelConfig] of Object.entries(config.channels)) {
