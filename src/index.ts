@@ -3,8 +3,10 @@ import fs from 'node:fs';
 import {Telegraf} from 'telegraf';
 import {ApiClient} from '@twurple/api';
 import {RefreshingAuthProvider} from '@twurple/auth';
-import { Low, JSONFile } from 'lowdb'
+import {Low, JSONFile} from 'lowdb'
 import lodash from 'lodash';
+import {escape} from 'html-escaper';
+import {fulfillWithTimeLimit} from "./utils.js";
 
 class LowWithLodash<T> extends Low<T> {
   chain: lodash.ExpChain<this['data']> = lodash.chain(this).get('data')
@@ -42,6 +44,7 @@ const authProvider = new RefreshingAuthProvider({
 }, twitchBotTokens);
 
 const bots = Object.fromEntries(Object.entries(config.bots).map(([key, token]) => [key, new Telegraf(token)]));
+
 function getBot(name: string) {
   const bot = bots[name];
   if (!bot) {
@@ -122,7 +125,7 @@ async function update(channelName: string, channelConfig: ConfigChannelEntry) {
   state.lastStreamTitle = title;
 
   const streamLinkHtml = `<a href='https://twitch.tv/${stream.userName}?rid=${crypto.randomBytes(5).toString('hex')}'>twitch.tv/${stream.userName}</a>`;
-  const message = `${title} | IN ONDA | ${streamLinkHtml}`;
+  const message = `${escape(title)} <b>| IN ONDA |</b> ${streamLinkHtml}`;
 
   if (state.lastStreamId === stream.id) {
     console.log('Updating alert title!');
@@ -131,7 +134,12 @@ async function update(channelName: string, channelConfig: ConfigChannelEntry) {
       return;
     }
     // Title changed! Edit message!
-    await bot.telegram.editMessageText(channelConfig.channelId || channelConfig.groupId, state.lastMessageId, undefined, message, {
+    if (channelConfig.channelId) {
+      await bot.telegram.editMessageText(channelConfig.channelId, state.lastMessageId, undefined, message, {
+        parse_mode: 'HTML'
+      });
+    }
+    await bot.telegram.editMessageText(channelConfig.groupId, state.lastGroupMessageId || state.lastMessageId, undefined, message, {
       parse_mode: 'HTML'
     });
     await statusDb.write();
@@ -148,7 +156,10 @@ async function update(channelName: string, channelConfig: ConfigChannelEntry) {
   state.lastMessageId = sendResult.message_id;
 
   if (channelConfig.channelId) {
-    const forwardResult = await bot.telegram.forwardMessage(channelConfig.groupId, channelConfig.channelId, state.lastMessageId);
+    //const forwardResult = await bot.telegram.forwardMessage(channelConfig.groupId, channelConfig.channelId, state.lastMessageId);
+    const forwardResult = await bot.telegram.sendMessage(channelConfig.groupId, message, {
+      parse_mode: 'HTML'
+    });
     state.lastGroupMessageId = forwardResult.message_id;
   } else {
     state.lastGroupMessageId = state.lastMessageId;
@@ -176,11 +187,32 @@ for (const bot of Object.values(bots)) {
 
 async function updateAll() {
   for (const [channel, channelConfig] of Object.entries(config.channels)) {
-    await update(channel, channelConfig);
+    await fulfillWithTimeLimit(15 * 1000, update(channel, channelConfig));
   }
 }
 
-// First update
-await updateAll();
-// Schedule next updates
-setInterval(updateAll, 30 * 1000);
+let running = true;
+let stopSleep: (() => void) | undefined;
+process.on('SIGTERM', () => {
+  console.log('SIGTERM signal received.');
+  running = false;
+  if (stopSleep) {
+    stopSleep();
+  }
+});
+
+while (running) {
+  try {
+    await updateAll();
+  } catch (e) {
+    console.error(e);
+  }
+  await new Promise(resolve => {
+    setTimeout(resolve, 30 * 10000);
+    stopSleep = resolve as any;
+  });
+  stopSleep = undefined;
+}
+
+console.log('Graceful shutdown done!');
+process.exit(0);
