@@ -1,0 +1,19 @@
+{
+  "twitchClientId": "tiwtchApiClientId",
+  "twitchClientToken": "twitchApiClientToken",
+  "channels": {
+    "channel1": {
+      "groupId": 0,
+      "channelId": 0,
+      "bot": "bot1"
+    },
+    "channel2": {
+      "groupId": 0,
+      "bot": "bot2"
+    }
+  },
+  "bots": {
+    "bot1": "token1",
+    "bot2": "token2"
+  }
+}
