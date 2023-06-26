@@ -3,21 +3,17 @@ import fs from 'node:fs';
 import {Telegraf} from 'telegraf';
 import {ApiClient} from '@twurple/api';
 import {RefreshingAuthProvider} from '@twurple/auth';
-import {Low, JSONFile} from 'lowdb'
-import lodash from 'lodash';
+import {JSONFile} from 'lowdb/node'
 import {escape} from 'html-escaper';
 import {fulfillWithTimeLimit} from "./utils.js";
-
-class LowWithLodash<T> extends Low<T> {
-  chain: lodash.ExpChain<this['data']> = lodash.chain(this).get('data')
-}
+import {Low} from "lowdb";
 
 type ConfigChannelEntry = {
-  groupId: number,
-  channelId: number,
+  groupIds: number[],
+  channelIds: number[],
   bot: string,
 };
-type Config = {
+export type Config = {
   twitchClientId: string,
   twitchClientToken: string,
   channels: Record<string, ConfigChannelEntry>,
@@ -27,8 +23,8 @@ type Config = {
 type ChannelState = {
   lastStreamId: string | null,
   lastStreamTitle: string | null,
-  lastMessageId: number | null;
-  lastGroupMessageId: number | null,
+  channels: Record<string, number | null>
+  groups: Record<string, number | null>
 };
 type StatusDb = Record<string, ChannelState>;
 
@@ -38,10 +34,11 @@ const twitchBotTokens = JSON.parse(fs.readFileSync('./twitch.tokens.json', 'utf-
 const authProvider = new RefreshingAuthProvider({
   clientId: config.twitchClientId,
   clientSecret: config.twitchClientToken,
-  onRefresh: async newTokenData => {
+  onRefresh: async (userId, newTokenData) => {
     return fs.promises.writeFile('./twitch.tokens.json', JSON.stringify(newTokenData, null, 2), 'utf-8');
   }
-}, twitchBotTokens);
+});
+await authProvider.addUserForToken(twitchBotTokens, []);
 
 const bots = Object.fromEntries(Object.entries(config.bots).map(([key, token]) => [key, new Telegraf(token)]));
 
@@ -55,16 +52,16 @@ function getBot(name: string) {
 
 const apiClient = new ApiClient({authProvider});
 
-const statusDb = new LowWithLodash(new JSONFile<StatusDb>('./state.json'));
+const statusDb = new Low(new JSONFile<StatusDb>('./state.json'), {});
 await statusDb.read();
 statusDb.data ||= {};
 for (const channel of Object.keys(config.channels)) {
-  const state = statusDb.chain.get(channel).value();
+  const state = statusDb.data[channel];
   statusDb.data[channel] = {
     lastStreamId: null,
     lastStreamTitle: null,
-    lastMessageId: null,
-    lastGroupMessageId: null,
+    channels: {},
+    groups: {},
     ...(state as any),
   };
 }
@@ -74,7 +71,7 @@ async function update(channelName: string, channelConfig: ConfigChannelEntry) {
   const bot = getBot(channelConfig.bot);
 
   console.log('Checking user ' + channelName + '!');
-  const state = statusDb.chain.get(channelName).value();
+  const state = statusDb.data[channelName];
 
   // Resolve user id by name
   const users = await apiClient.users.getUsersByNames([channelName]);
@@ -93,22 +90,40 @@ async function update(channelName: string, channelConfig: ConfigChannelEntry) {
     console.log('Not online!');
 
     // Unpin the pinned notification, if present
-    if (state.lastGroupMessageId) {
-      bot.telegram.getChat(channelConfig.groupId).then(async chat => {
-        const pinnedMessage = chat.pinned_message;
+    for(const [groupId, lastGroupMessageId] of Object.entries(state.groups)) {
+      if (!lastGroupMessageId) {
+        continue;
+      }
 
-        if (!pinnedMessage || pinnedMessage.message_id !== state.lastGroupMessageId) {
-          state.lastGroupMessageId = null;
+      console.log('Un-pinning notification!');
+      try {
+        await bot.telegram.unpinChatMessage(groupId, lastGroupMessageId);
+      } catch (error) {
+        console.warn('Unable to unpin message', error);
+      }
+      state.groups[groupId] = null;
+      await statusDb.write();
+
+      /*
+      bot.telegram.getChat(groupId).then(async chat => {
+        const pinnedMessage = chat.pinned_message;
+        if (!pinnedMessage || pinnedMessage.message_id !== lastGroupMessageId) {
+          state.groups[groupId] = null;
           await statusDb.write();
           return;
         }
-
         console.log('Un-pinning notification!');
-        await bot.telegram.unpinChatMessage(channelConfig.groupId);
-        state.lastGroupMessageId = null;
+        try {
+          await bot.telegram.unpinChatMessage(groupId, lastGroupMessageId);
+        } catch (error) {
+          console.warn('Unable to unpin message', error);
+        }
+        state.groups[groupId] = null;
         await statusDb.write();
       });
+      */
     }
+
     return;
   }
 
@@ -128,44 +143,79 @@ async function update(channelName: string, channelConfig: ConfigChannelEntry) {
   const message = `${escape(title)} <b>| IN ONDA |</b> ${streamLinkHtml}`;
 
   if (state.lastStreamId === stream.id) {
-    console.log('Updating alert title!');
-    if (!state.lastMessageId) {
-      console.error('Missing last message id in status! Skip...'); // Should never happen
-      return;
-    }
     // Title changed! Edit message!
-    if (channelConfig.channelId) {
-      await bot.telegram.editMessageText(channelConfig.channelId, state.lastMessageId, undefined, message, {
+    console.log('Updating alert title!');
+    let changes = false;
+    for (const [channelId, lastMessageId] of Object.entries(state.channels)) {
+      if (!lastMessageId) {
+        console.error('Missing last message id in status! Skip...'); // Should never happen
+        continue;
+      }
+      await bot.telegram.editMessageText(channelId, lastMessageId, undefined, message, {
         parse_mode: 'HTML'
       });
+      changes = true;
     }
-    await bot.telegram.editMessageText(channelConfig.groupId, state.lastGroupMessageId || state.lastMessageId, undefined, message, {
-      parse_mode: 'HTML'
-    });
-    await statusDb.write();
+    for (const [groupId, lastGroupMessageId] of Object.entries(state.groups)) {
+      if (!lastGroupMessageId) {
+        console.error('Missing last group message id in status! Skip...'); // Should never happen
+        continue;
+      }
+      await bot.telegram.editMessageText(groupId, lastGroupMessageId, undefined, message, {
+        parse_mode: 'HTML'
+      });
+      changes = true;
+    }
+    if (changes) {
+      await statusDb.write();
+    }
     return;
   }
   state.lastStreamId = stream.id;
 
   // New stream!
   console.log('New stream detected! Notify!');
-  // Send notification and pin message
-  const sendResult = await bot.telegram.sendMessage(channelConfig.channelId || channelConfig.groupId, message, {
-    parse_mode: 'HTML'
-  });
-  state.lastMessageId = sendResult.message_id;
 
-  if (channelConfig.channelId) {
-    //const forwardResult = await bot.telegram.forwardMessage(channelConfig.groupId, channelConfig.channelId, state.lastMessageId);
-    const forwardResult = await bot.telegram.sendMessage(channelConfig.groupId, message, {
-      parse_mode: 'HTML'
-    });
-    state.lastGroupMessageId = forwardResult.message_id;
-  } else {
-    state.lastGroupMessageId = state.lastMessageId;
+  // Cleanup removed groups and channels
+  for (const channelId in state.channels) {
+    if (channelConfig.channelIds.includes(parseInt(channelId))) {
+      continue;
+    }
+    delete state.channels[channelId];
+  }
+  for (const groupId in state.groups) {
+    if (channelConfig.channelIds.includes(parseInt(groupId))) {
+      continue;
+    }
+    delete state.channels[groupId];
   }
 
-  await bot.telegram.pinChatMessage(channelConfig.groupId, state.lastGroupMessageId);
+  // Send notification and pin message
+  for (const channelId of channelConfig.channelIds) {
+    const sendResult = await bot.telegram.sendMessage(channelId, message, {
+      parse_mode: 'HTML'
+    });
+    state.channels[channelId] = sendResult.message_id;
+  }
+  for (const groupId of channelConfig.groupIds) {
+    /*
+    const channelId = channelConfig.channelIds[0];
+    if (channelId) {
+      const forwardResult = await bot.telegram.forwardMessage(groupId, channelId, state.channels[channelId]!);
+      state.groups[groupId] = forwardResult.message_id;
+    } else {
+      const sendResult = await bot.telegram.sendMessage(groupId, message, {
+        parse_mode: 'HTML'
+      });
+      state.groups[groupId] = sendResult.message_id;
+    }
+    */
+    const sendResult = await bot.telegram.sendMessage(groupId, message, {
+      parse_mode: 'HTML'
+    });
+    state.groups[groupId] = sendResult.message_id;
+    await bot.telegram.pinChatMessage(groupId, state.groups[groupId]!);
+  }
 
   await statusDb.write();
 }
@@ -182,12 +232,27 @@ process.once('SIGTERM', () => {
 });
 
 for (const bot of Object.values(bots)) {
-  await bot.launch();
+  console.log(`Starting bot ${bot.telegram.token}`);
+  bot.launch()
+      .then();
 }
 
 async function updateAll() {
   for (const [channel, channelConfig] of Object.entries(config.channels)) {
     await fulfillWithTimeLimit(15 * 1000, update(channel, channelConfig));
+  }
+  // Cleanup
+  let changes = false;
+  for (const channel in statusDb.data) {
+    if (config.channels[channel]) {
+      continue;
+    }
+    changes = true;
+    delete statusDb.data[channel];
+    console.log(`Removing ${channel} from db`);
+  }
+  if (changes) {
+    await statusDb.write();
   }
 }
 
@@ -200,6 +265,8 @@ process.on('SIGTERM', () => {
     stopSleep();
   }
 });
+
+console.log('Starting...');
 
 while (running) {
   try {
