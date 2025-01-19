@@ -153,6 +153,8 @@ async function update(channelName: string, channelConfig: ConfigChannelEntry) {
             }
             await bot.telegram.editMessageText(channelId, lastMessageId, undefined, message, {
                 parse_mode: 'HTML'
+            }).catch(error => {
+                console.error(error);
             });
             changes = true;
         }
@@ -163,6 +165,8 @@ async function update(channelName: string, channelConfig: ConfigChannelEntry) {
             }
             await bot.telegram.editMessageText(groupId, lastGroupMessageId, undefined, message, {
                 parse_mode: 'HTML'
+            }).catch(error => {
+                console.error(error);
             });
             changes = true;
         }
@@ -178,43 +182,51 @@ async function update(channelName: string, channelConfig: ConfigChannelEntry) {
 
     // Cleanup removed groups and channels
     for (const channelId in state.channels) {
-        if (channelConfig.channelIds.includes(parseInt(channelId))) {
+        if ((channelConfig.channelIds || []).includes(parseInt(channelId))) {
             continue;
         }
         delete state.channels[channelId];
     }
     for (const groupId in state.groups) {
-        if (channelConfig.channelIds.includes(parseInt(groupId))) {
+        if ((channelConfig.groupIds || []).includes(parseInt(groupId))) {
             continue;
         }
         delete state.channels[groupId];
     }
 
     // Send notification and pin message
-    for (const channelId of channelConfig.channelIds) {
-        const sendResult = await bot.telegram.sendMessage(channelId, message, {
-            parse_mode: 'HTML'
-        });
-        state.channels[channelId] = sendResult.message_id;
-    }
-    for (const groupId of channelConfig.groupIds) {
-        /*
-        const channelId = channelConfig.channelIds[0];
-        if (channelId) {
-          const forwardResult = await bot.telegram.forwardMessage(groupId, channelId, state.channels[channelId]!);
-          state.groups[groupId] = forwardResult.message_id;
-        } else {
-          const sendResult = await bot.telegram.sendMessage(groupId, message, {
-            parse_mode: 'HTML'
-          });
-          state.groups[groupId] = sendResult.message_id;
+    for (const channelId of (channelConfig.channelIds || [])) {
+        try {
+            const sendResult = await bot.telegram.sendMessage(channelId, message, {
+                parse_mode: 'HTML'
+            });
+            state.channels[channelId] = sendResult.message_id;
+        } catch (error) {
+            console.error(error);
         }
-        */
-        const sendResult = await bot.telegram.sendMessage(groupId, message, {
-            parse_mode: 'HTML'
-        });
-        state.groups[groupId] = sendResult.message_id;
-        await bot.telegram.pinChatMessage(groupId, state.groups[groupId]!);
+    }
+    for (const groupId of (channelConfig.groupIds || [])) {
+        try {
+            /*
+            const channelId = channelConfig.channelIds[0];
+            if (channelId) {
+              const forwardResult = await bot.telegram.forwardMessage(groupId, channelId, state.channels[channelId]!);
+              state.groups[groupId] = forwardResult.message_id;
+            } else {
+              const sendResult = await bot.telegram.sendMessage(groupId, message, {
+                parse_mode: 'HTML'
+              });
+              state.groups[groupId] = sendResult.message_id;
+            }
+            */
+            const sendResult = await bot.telegram.sendMessage(groupId, message, {
+                parse_mode: 'HTML'
+            });
+            state.groups[groupId] = sendResult.message_id;
+            await bot.telegram.pinChatMessage(groupId, state.groups[groupId]!);
+        } catch (error) {
+            console.error(error);
+        }
     }
 
     await statusDb.write();
